@@ -1,0 +1,351 @@
+pipeline {
+    agent any
+    
+    environment {
+        AWS_REGION = 'us-east-1'
+        PROJECT_NAME = 'devops-assignment'
+        AWS_CREDENTIALS = credentials('aws-credentials')
+        SSH_KEY = credentials('terraform-ssh-key')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.BUILD_TIMESTAMP = sh(
+                        script: 'date +%Y%m%d-%H%M%S',
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+        
+        stage('Test Django Application') {
+            steps {
+                script {
+                    dir('django_app') {
+                        sh '''
+                            python3 -m venv venv
+                            . venv/bin/activate
+                            pip install -r requirements.txt
+                            python manage.py migrate
+                            python test_app.py
+                        '''
+                    }
+                }
+            }
+            post {
+                always {
+                    publishTestResults testResultsPattern: 'django_app/test-results.xml'
+                }
+            }
+        }
+        
+        stage('Lint Code') {
+            steps {
+                sh '''
+                    pip3 install flake8
+                    flake8 django_app --count --select=E9,F63,F7,F82 --show-source --statistics
+                '''
+            }
+        }
+        
+        stage('Build Docker Images') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch pattern: 'ITA.*', comparator: 'REGEXP'
+                }
+            }
+            steps {
+                script {
+                    // Build Django image
+                    sh '''
+                        docker build -t django-app:${BUILD_NUMBER} -f docker/web/Dockerfile django_app/
+                        docker tag django-app:${BUILD_NUMBER} django-app:latest
+                    '''
+                    
+                    // Build PostgreSQL image
+                    sh '''
+                        docker build -t postgres-app:${BUILD_NUMBER} docker/db/
+                        docker tag postgres-app:${BUILD_NUMBER} postgres-app:latest
+                    '''
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch pattern: 'ITA.*', comparator: 'REGEXP'
+                }
+            }
+            steps {
+                script {
+                    // Scan Docker images for vulnerabilities
+                    sh '''
+                        # Install trivy if not available
+                        if ! command -v trivy &> /dev/null; then
+                            wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+                            echo "deb https://aquasecurity.github.io/trivy-repo/deb generic main" | sudo tee -a /etc/apt/sources.list
+                            sudo apt-get update
+                            sudo apt-get install trivy
+                        fi
+                        
+                        # Scan images
+                        trivy image --exit-code 0 --severity HIGH,CRITICAL django-app:latest
+                        trivy image --exit-code 0 --severity HIGH,CRITICAL postgres-app:latest
+                    '''
+                }
+            }
+        }
+        
+        stage('Deploy Infrastructure') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch pattern: 'ITA.*', comparator: 'REGEXP'
+                }
+            }
+            steps {
+                script {
+                    dir('terraform') {
+                        // Configure AWS credentials
+                        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials']]) {
+                            sh '''
+                                # Initialize Terraform
+                                terraform init
+                                
+                                # Plan deployment
+                                terraform plan -out=tfplan
+                                
+                                # Apply configuration
+                                terraform apply -auto-approve tfplan
+                                
+                                # Save outputs for later stages
+                                terraform output -json > ../terraform-outputs.json
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Configure Servers') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch pattern: 'ITA.*', comparator: 'REGEXP'
+                }
+            }
+            steps {
+                script {
+                    dir('ansible') {
+                        sh '''
+                            # Generate inventory from Terraform outputs
+                            chmod +x generate-inventory.sh
+                            ./generate-inventory.sh
+                            
+                            # Set proper permissions for SSH key
+                            chmod 600 ../terraform/terraform-key.pem
+                            
+                            # Wait for instances to be ready
+                            sleep 120
+                            
+                            # Test connectivity
+                            for i in {1..5}; do
+                                if ansible all -m ping --timeout=30; then
+                                    echo "SSH connectivity successful"
+                                    break
+                                else
+                                    echo "SSH connectivity failed, attempt $i/5"
+                                    sleep 30
+                                fi
+                            done
+                            
+                            # Run Ansible playbooks
+                            ansible-playbook playbooks/site.yml
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy Application') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch pattern: 'ITA.*', comparator: 'REGEXP'
+                }
+            }
+            steps {
+                script {
+                    dir('ansible') {
+                        sh '''
+                            # Deploy application stack
+                            ansible-playbook playbooks/swarm-deploy.yml
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Integration Tests') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch pattern: 'ITA.*', comparator: 'REGEXP'
+                }
+            }
+            steps {
+                script {
+                    sh '''
+                        # Run comprehensive tests
+                        chmod +x scripts/test.sh
+                        ./scripts/test.sh
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'test-report-*.txt', fingerprint: true
+                }
+            }
+        }
+        
+        stage('Performance Tests') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch pattern: 'ITA.*', comparator: 'REGEXP'
+                }
+            }
+            steps {
+                script {
+                    dir('terraform') {
+                        sh '''
+                            # Get application URL
+                            MANAGER_IP=$(terraform output -raw swarm_manager_public_ip)
+                            
+                            # Install Apache Bench if not available
+                            sudo apt-get update
+                            sudo apt-get install -y apache2-utils
+                            
+                            # Run performance test
+                            ab -n 100 -c 10 http://$MANAGER_IP/login/ > performance-report.txt || true
+                        '''
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'terraform/performance-report.txt', fingerprint: true
+                }
+            }
+        }
+        
+        stage('Notify Success') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch pattern: 'ITA.*', comparator: 'REGEXP'
+                }
+            }
+            steps {
+                script {
+                    dir('terraform') {
+                        sh '''
+                            echo "Deployment successful!"
+                            echo "Application URLs:"
+                            echo "- Manager: http://$(terraform output -raw swarm_manager_public_ip)/login/"
+                            echo "- Worker A: http://$(terraform output -raw swarm_worker_a_public_ip)/login/"
+                            echo "- Worker B: http://$(terraform output -raw swarm_worker_b_public_ip)/login/"
+                        '''
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Clean up workspace
+            cleanWs()
+        }
+        
+        success {
+            // Send success notification
+            script {
+                if (env.BRANCH_NAME == 'main' || env.BRANCH_NAME.startsWith('ITA')) {
+                    emailext (
+                        subject: "✅ Deployment Successful - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                        body: """
+                        Deployment completed successfully!
+                        
+                        Branch: ${env.BRANCH_NAME}
+                        Build: ${env.BUILD_NUMBER}
+                        Timestamp: ${env.BUILD_TIMESTAMP}
+                        
+                        Application is now accessible at the deployed URLs.
+                        
+                        Check the build logs for detailed information.
+                        """,
+                        to: "${env.CHANGE_AUTHOR_EMAIL ?: 'admin@example.com'}"
+                    )
+                }
+            }
+        }
+        
+        failure {
+            // Clean up on failure
+            script {
+                if (env.BRANCH_NAME == 'main' || env.BRANCH_NAME.startsWith('ITA')) {
+                    dir('terraform') {
+                        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials']]) {
+                            sh '''
+                                # Attempt to destroy infrastructure on failure
+                                terraform init || true
+                                terraform destroy -auto-approve || true
+                            '''
+                        }
+                    }
+                }
+            }
+            
+            // Send failure notification
+            emailext (
+                subject: "❌ Deployment Failed - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+                Deployment failed!
+                
+                Branch: ${env.BRANCH_NAME}
+                Build: ${env.BUILD_NUMBER}
+                Timestamp: ${env.BUILD_TIMESTAMP}
+                
+                Please check the build logs for error details.
+                Infrastructure has been cleaned up automatically.
+                """,
+                to: "${env.CHANGE_AUTHOR_EMAIL ?: 'admin@example.com'}"
+            )
+        }
+        
+        unstable {
+            // Send unstable notification
+            emailext (
+                subject: "⚠️ Deployment Unstable - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+                Deployment completed but some tests failed.
+                
+                Branch: ${env.BRANCH_NAME}
+                Build: ${env.BUILD_NUMBER}
+                Timestamp: ${env.BUILD_TIMESTAMP}
+                
+                Please review the test results and logs.
+                """,
+                to: "${env.CHANGE_AUTHOR_EMAIL ?: 'admin@example.com'}"
+            )
+        }
+    }
+}

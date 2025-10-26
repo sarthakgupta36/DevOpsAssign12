@@ -1,0 +1,237 @@
+name: Deploy to AWS (Fixed)
+
+on:
+  push:
+    branches: [ main, ITA* ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_NAME: devops-assignment
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: Test Django Application
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        cd django_app
+        pip install -r requirements.txt
+        
+    - name: Run Django tests
+      run: |
+        cd django_app
+        python manage.py migrate
+        python test_app.py
+        
+    - name: Lint Python code
+      run: |
+        pip install flake8
+        flake8 django_app --count --select=E9,F63,F7,F82 --show-source --statistics
+        
+  build:
+    runs-on: ubuntu-latest
+    name: Build Docker Images
+    needs: test
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/ITA')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Build Django image
+      run: |
+        docker build -t django-app:${{ github.sha }} -f docker/web/Dockerfile django_app/
+        
+    - name: Build PostgreSQL image
+      run: |
+        docker build -t postgres-app:${{ github.sha }} docker/db/
+        
+    - name: Test Docker images
+      run: |
+        # Test that images were built successfully
+        docker images | grep django-app
+        docker images | grep postgres-app
+        
+  # Check if AWS secrets are available
+  check-secrets:
+    runs-on: ubuntu-latest
+    outputs:
+      has-aws-secrets: ${{ steps.check.outputs.has-secrets }}
+    steps:
+    - name: Check for AWS secrets
+      id: check
+      run: |
+        if [[ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" && -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]]; then
+          echo "has-secrets=true" >> $GITHUB_OUTPUT
+        else
+          echo "has-secrets=false" >> $GITHUB_OUTPUT
+        fi
+        
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy to AWS
+    needs: [test, build, check-secrets]
+    if: |
+      needs.check-secrets.outputs.has-aws-secrets == 'true' && 
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/ITA'))
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        mask-aws-account-id: false
+        
+    - name: Verify AWS credentials
+      run: |
+        aws sts get-caller-identity
+        
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
+        
+    - name: Set up Ansible
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ansible
+        
+    - name: Terraform Init
+      run: |
+        cd terraform
+        terraform init
+        
+    - name: Terraform Plan
+      run: |
+        cd terraform
+        terraform plan -out=tfplan
+        
+    - name: Terraform Apply
+      run: |
+        cd terraform
+        terraform apply -auto-approve tfplan
+        
+    - name: Generate Ansible Inventory
+      run: |
+        cd ansible
+        chmod +x generate-inventory.sh
+        ./generate-inventory.sh
+        
+    - name: Wait for instances to be ready
+      run: |
+        echo "Waiting for instances to be ready..."
+        sleep 120
+        
+    - name: Test SSH connectivity
+      run: |
+        cd ansible
+        # Set proper permissions for SSH key
+        chmod 600 ../terraform/terraform-key.pem
+        # Test connectivity with retries
+        for i in {1..5}; do
+          if ansible all -m ping --timeout=30; then
+            echo "SSH connectivity successful"
+            break
+          else
+            echo "SSH connectivity failed, attempt $i/5"
+            sleep 30
+          fi
+        done
+        
+    - name: Deploy with Ansible
+      run: |
+        cd ansible
+        ansible-playbook playbooks/site.yml
+        
+    - name: Run deployment tests
+      run: |
+        chmod +x scripts/test.sh
+        ./scripts/test.sh
+        
+    - name: Get application URLs
+      run: |
+        cd terraform
+        echo "Application deployed successfully!"
+        echo "Access URLs:"
+        echo "- Manager: http://$(terraform output -raw swarm_manager_public_ip)/login/"
+        echo "- Worker A: http://$(terraform output -raw swarm_worker_a_public_ip)/login/"
+        echo "- Worker B: http://$(terraform output -raw swarm_worker_b_public_ip)/login/"
+        
+    - name: Upload test report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-report-${{ github.run_number }}
+        path: test-report-*.txt
+        retention-days: 30
+        
+  # Skip deployment if no AWS secrets
+  skip-deploy:
+    runs-on: ubuntu-latest
+    name: Skip AWS Deployment
+    needs: [test, build, check-secrets]
+    if: needs.check-secrets.outputs.has-aws-secrets == 'false'
+    
+    steps:
+    - name: Skip deployment message
+      run: |
+        echo "⚠️ AWS deployment skipped - AWS credentials not configured"
+        echo ""
+        echo "To enable AWS deployment:"
+        echo "1. Go to repository Settings → Secrets and variables → Actions"
+        echo "2. Add AWS_ACCESS_KEY_ID secret"
+        echo "3. Add AWS_SECRET_ACCESS_KEY secret"
+        echo "4. Re-run the workflow"
+        echo ""
+        echo "✅ Local testing and Docker builds completed successfully!"
+        echo "✅ You can still deploy manually using: ./scripts/free-tier-deploy.sh"
+        
+  cleanup-on-failure:
+    runs-on: ubuntu-latest
+    name: Cleanup on Failure
+    needs: [deploy]
+    if: failure() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/ITA'))
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
+        
+    - name: Terraform Destroy
+      run: |
+        cd terraform
+        terraform init
+        terraform destroy -auto-approve
+      continue-on-error: true

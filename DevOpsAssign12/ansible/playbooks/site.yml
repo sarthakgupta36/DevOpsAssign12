@@ -1,0 +1,32 @@
+---
+# Main Ansible playbook for DevOps assignment
+- name: Configure all infrastructure
+  hosts: all
+  become: yes
+  gather_facts: yes
+  
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+        
+    - name: Install common packages
+      apt:
+        name:
+          - curl
+          - wget
+          - git
+          - htop
+          - vim
+          - unzip
+        state: present
+
+# Configure Docker on all Swarm nodes
+- import_playbook: docker-install.yml
+
+# Initialize Docker Swarm
+- import_playbook: swarm-init.yml
+
+# Deploy application stack
+- import_playbook: swarm-deploy.yml

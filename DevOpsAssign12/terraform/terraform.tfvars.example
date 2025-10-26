@@ -1,0 +1,22 @@
+# Example Terraform variables file
+# Copy this file to terraform.tfvars and customize the values
+
+# AWS Configuration
+aws_region = "us-east-1"
+
+# Project Configuration
+project_name = "devops-assignment"
+environment  = "dev"
+
+# Instance Configuration
+instance_type = "t2.micro"  # Free tier eligible
+
+# Network Configuration
+vpc_cidr           = "10.0.0.0/16"
+public_subnet_cidr = "10.0.1.0/24"
+
+# Security Configuration
+allowed_ssh_cidr = "0.0.0.0/0"  # Restrict this to your IP for better security
+
+# Key Pair Configuration
+key_name = "devops-assignment-key"

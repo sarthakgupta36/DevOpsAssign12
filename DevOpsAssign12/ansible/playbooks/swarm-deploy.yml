@@ -1,0 +1,155 @@
+---
+# Docker Swarm application deployment playbook
+- name: Deploy application stack to Swarm
+  hosts: swarm_managers
+  become: yes
+  gather_facts: yes
+  
+  vars:
+    app_name: "myapp"
+    compose_file: "docker-compose.yml"
+    
+  tasks:
+    - name: Create application directory
+      file:
+        path: /home/ubuntu/app
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+        
+    - name: Copy docker-compose file
+      copy:
+        src: "../../{{ compose_file }}"
+        dest: "/home/ubuntu/app/{{ compose_file }}"
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
+        
+    - name: Copy Django application files
+      synchronize:
+        src: "../../django_app/"
+        dest: "/home/ubuntu/app/django_app/"
+        delete: yes
+        rsync_opts:
+          - "--exclude=__pycache__"
+          - "--exclude=*.pyc"
+          - "--exclude=db.sqlite3"
+          - "--exclude=venv"
+          - "--exclude=.git"
+      delegate_to: localhost
+      
+    - name: Copy Docker files
+      synchronize:
+        src: "../../docker/"
+        dest: "/home/ubuntu/app/docker/"
+        delete: yes
+      delegate_to: localhost
+      
+    - name: Set ownership of application files
+      file:
+        path: /home/ubuntu/app
+        owner: ubuntu
+        group: ubuntu
+        recurse: yes
+        
+    - name: Build Docker images
+      command: docker build -t {{ item.tag }} -f {{ item.dockerfile }} {{ item.context }}
+      loop:
+        - { tag: "django-app:latest", dockerfile: "docker/web/Dockerfile", context: "django_app/" }
+        - { tag: "postgres-app:latest", dockerfile: "docker/db/Dockerfile", context: "docker/db/" }
+      args:
+        chdir: /home/ubuntu/app
+      become_user: ubuntu
+      
+    - name: Check if stack is already deployed
+      command: docker stack ls --format "{{ "{{" }}.Name{{ "}}" }}"
+      register: existing_stacks
+      changed_when: false
+      
+    - name: Remove existing stack if present
+      command: docker stack rm {{ app_name }}
+      when: app_name in existing_stacks.stdout_lines
+      
+    - name: Wait for stack removal to complete
+      pause:
+        seconds: 30
+      when: app_name in existing_stacks.stdout_lines
+      
+    - name: Deploy application stack
+      command: docker stack deploy -c {{ compose_file }} {{ app_name }}
+      args:
+        chdir: /home/ubuntu/app
+      become_user: ubuntu
+      register: deploy_result
+      
+    - name: Display deployment result
+      debug:
+        msg: "Stack '{{ app_name }}' deployed successfully"
+      when: deploy_result.rc == 0
+      
+    - name: Wait for services to start
+      pause:
+        seconds: 60
+        
+    - name: Check service status
+      command: docker service ls
+      register: service_status
+      become_user: ubuntu
+      
+    - name: Display service status
+      debug:
+        msg: "{{ service_status.stdout_lines }}"
+        
+    - name: Check stack services
+      command: docker stack services {{ app_name }}
+      register: stack_services
+      become_user: ubuntu
+      
+    - name: Display stack services
+      debug:
+        msg: "{{ stack_services.stdout_lines }}"
+        
+    - name: Get service logs (web)
+      command: docker service logs {{ app_name }}_web --tail 20
+      register: web_logs
+      become_user: ubuntu
+      failed_when: false
+      
+    - name: Display web service logs
+      debug:
+        msg: "{{ web_logs.stdout_lines }}"
+      when: web_logs.stdout_lines is defined
+      
+    - name: Test application endpoint
+      uri:
+        url: "http://{{ ansible_default_ipv4.address }}/login/"
+        method: GET
+        status_code: 200
+      register: app_test
+      retries: 5
+      delay: 10
+      until: app_test.status == 200
+      ignore_errors: yes
+      
+    - name: Display application test result
+      debug:
+        msg: "Application is accessible at http://{{ ansible_default_ipv4.address }}/login/"
+      when: app_test.status == 200
+      
+    - name: Display application access information
+      debug:
+        msg: |
+          Application deployed successfully!
+          
+          Access URLs:
+          - Manager: http://{{ ansible_default_ipv4.address }}/login/
+          {% for host in groups['swarm_workers'] %}
+          - Worker {{ loop.index }}: http://{{ hostvars[host]['ansible_default_ipv4']['address'] }}/login/
+          {% endfor %}
+          
+          Management Commands:
+          - Check services: docker service ls
+          - Scale web service: docker service scale {{ app_name }}_web=3
+          - View logs: docker service logs {{ app_name }}_web
+          - Remove stack: docker stack rm {{ app_name }}

@@ -1,0 +1,132 @@
+---
+# Docker installation playbook
+- name: Install Docker on Swarm nodes
+  hosts: swarm_nodes
+  become: yes
+  gather_facts: yes
+  
+  vars:
+    docker_compose_version: "2.20.0"
+    
+  tasks:
+    - name: Remove old Docker packages
+      apt:
+        name:
+          - docker
+          - docker-engine
+          - docker.io
+          - containerd
+          - runc
+        state: absent
+        
+    - name: Install prerequisites
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+        state: present
+        update_cache: yes
+        
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+        
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+        
+    - name: Install Docker
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+        update_cache: yes
+        
+    - name: Add ubuntu user to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+        
+    - name: Start and enable Docker service
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+        
+    - name: Install Docker Compose
+      get_url:
+        url: "https://github.com/docker/compose/releases/download/v{{ docker_compose_version }}/docker-compose-{{ ansible_system }}-{{ ansible_architecture }}"
+        dest: /usr/local/bin/docker-compose
+        mode: '0755'
+        
+    - name: Create Docker Compose symlink
+      file:
+        src: /usr/local/bin/docker-compose
+        dest: /usr/bin/docker-compose
+        state: link
+        
+    - name: Configure Docker daemon
+      copy:
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            },
+            "storage-driver": "overlay2"
+          }
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+      notify: restart docker
+      
+    - name: Configure firewall for Docker Swarm
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "2377"  # Swarm management
+        - "7946"  # Node communication
+      when: ansible_distribution == "Ubuntu"
+      
+    - name: Configure firewall for Docker Swarm UDP
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: udp
+      loop:
+        - "7946"  # Node communication
+        - "4789"  # Overlay network
+      when: ansible_distribution == "Ubuntu"
+      
+    - name: Verify Docker installation
+      command: docker --version
+      register: docker_version
+      
+    - name: Display Docker version
+      debug:
+        msg: "Docker installed: {{ docker_version.stdout }}"
+        
+    - name: Verify Docker Compose installation
+      command: docker-compose --version
+      register: compose_version
+      
+    - name: Display Docker Compose version
+      debug:
+        msg: "Docker Compose installed: {{ compose_version.stdout }}"
+        
+  handlers:
+    - name: restart docker
+      systemd:
+        name: docker
+        state: restarted

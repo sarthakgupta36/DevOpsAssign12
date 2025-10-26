@@ -1,0 +1,5 @@
+---
+# Docker role default variables
+docker_compose_version: "2.20.0"
+docker_users:
+  - ubuntu
